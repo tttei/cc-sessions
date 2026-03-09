@@ -8,7 +8,7 @@
 
 ## English
 
-A TUI + CLI tool for managing Claude Code conversation history: browse, search, resume, delete sessions.
+A TUI + CLI tool for managing Claude Code conversation history: browse, search, rename, resume, delete sessions.
 
 Pure Python 3 stdlib, no external dependencies.
 
@@ -31,7 +31,7 @@ Run `cc-sessions` with no arguments:
    Setup CI/CD pipeline                     2 days ago  156.3 KB
    Debug payment webhook                    3 days ago    4.1 MB
 ─────────────────────────────────────────────────────────────
- j/k:move  Enter:detail  /:search  d:delete  c:copy ID  r:refresh  q:quit
+ j/k:move  Enter:detail  /:search  +:new  n:rename  d:delete  c:copy  r:refresh  q:quit
 ```
 
 #### List view
@@ -43,6 +43,8 @@ Run `cc-sessions` with no arguments:
 | `g` / `G` | Jump to top / bottom |
 | `Enter` / `→` / `l` | Open detail view |
 | `/` | Search (live filter) |
+| `+` / `a` | Create new session |
+| `n` | Rename session |
 | `d` | Delete session (with confirmation) |
 | `c` | Copy full session ID to clipboard |
 | `r` | Refresh list |
@@ -86,15 +88,36 @@ Shows metadata and a preview of recent messages:
     Added logout endpoint with token blacklist to prevent
     reuse of invalidated tokens.
 ─────────────────────────────────────────────────────────────
- q:back  Enter:resume  d:delete  c:copy ID
+ q:back  Enter:resume  n:rename  d:delete  c:copy ID
 ```
 
 | Key | Action |
 |-----|--------|
 | `Enter` | **Resume session in a new terminal tab** (auto `cd` + `claude --resume`) |
+| `n` | Rename this session |
 | `d` | Delete this session |
 | `c` | Copy full session ID to clipboard |
 | `q` / `Esc` / `←` / `h` | Back to list |
+
+#### Create a new session
+
+Press `+` or `a` in the list view. Optionally enter a session name (or press `Enter` to skip):
+
+```
+ Name: my new feature█  (Enter:create  Esc:cancel)
+```
+
+A new terminal tab opens with `claude`. If you provided a name, the tool will automatically detect the new session and rename it.
+
+#### Rename a session
+
+Press `n` in list or detail view. Type the new name and press `Enter`:
+
+```
+ Rename: My new session name█  (Enter:confirm  Esc:cancel)
+```
+
+The existing title is pre-filled for editing. If the session already has a custom title, it is **overwritten** (not duplicated). The rename is also reflected in Claude Code's built-in `/resume` list.
 
 #### Resume a session
 
@@ -130,6 +153,9 @@ cc-sessions delete a3b7c912               # Delete (auto backup + confirm)
 cc-sessions delete -f a3b7c912            # Force delete, skip confirm
 cc-sessions delete --before 2025-01-01    # Bulk delete old sessions
 
+cc-sessions rename a3b7c912 "New title"   # Rename a session
+cc-sessions rename a3b7c912               # Interactive rename (prompts)
+
 cc-sessions clean --dry-run               # Preview orphaned files
 cc-sessions clean                         # Clean orphaned files
 cc-sessions stats                         # Disk usage statistics
@@ -152,13 +178,31 @@ Show the output to the user.
 
 Then use `/sessions list -n 5` inside Claude Code.
 
+### Configuration
+
+Create `config.json` next to `cc-sessions.py` (or at `~/.config/cc-sessions/config.json`):
+
+```jsonc
+{
+    // Working directory for new sessions (default: "~")
+    // When you press '+' in the TUI, `claude` opens in this directory.
+    "new_session_cwd": "~/Codes"
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `new_session_cwd` | `~` | Working directory when creating new sessions via `+` |
+
+All fields are optional. The file supports `//` comments.
+
 ---
 
 <a id="中文版"></a>
 
 ## 中文版
 
-管理 Claude Code 对话记录的 TUI + CLI 工具：浏览、搜索、恢复、删除会话。
+管理 Claude Code 对话记录的 TUI + CLI 工具：浏览、搜索、重命名、恢复、删除会话。
 
 纯 Python 3 标准库实现，无外部依赖。
 
@@ -181,7 +225,7 @@ source ~/.zshrc
    Setup CI/CD pipeline                     2 days ago  156.3 KB
    Debug payment webhook                    3 days ago    4.1 MB
 ─────────────────────────────────────────────────────────────
- j/k:move  Enter:detail  /:search  d:delete  c:copy ID  r:refresh  q:quit
+ j/k:move  Enter:detail  /:search  +:new  n:rename  d:delete  c:copy  r:refresh  q:quit
 ```
 
 #### 列表页
@@ -193,6 +237,8 @@ source ~/.zshrc
 | `g` / `G` | 跳到顶部 / 底部 |
 | `Enter` / `→` / `l` | 进入详情页 |
 | `/` | 搜索（实时过滤） |
+| `+` / `a` | 新建对话 |
+| `n` | 重命名对话 |
 | `d` | 删除对话（需确认） |
 | `c` | 复制完整 session ID 到剪贴板 |
 | `r` | 刷新列表 |
@@ -236,15 +282,36 @@ source ~/.zshrc
     已添加 logout endpoint 和 token blacklist 机制，
     防止已登出的 token 继续使用。
 ─────────────────────────────────────────────────────────────
- q:back  Enter:resume  d:delete  c:copy ID
+ q:back  Enter:resume  n:rename  d:delete  c:copy ID
 ```
 
 | 键 | 功能 |
 |----|------|
 | `Enter` | **在新终端 tab 中恢复对话**（自动 `cd` + `claude --resume`） |
+| `n` | 重命名当前对话 |
 | `d` | 删除当前对话 |
 | `c` | 复制完整 session ID 到剪贴板 |
 | `q` / `Esc` / `←` / `h` | 返回列表 |
+
+#### 新建对话
+
+在列表页按 `+` 或 `a`，可选输入对话名称（按 `Enter` 跳过）：
+
+```
+ Name: 新功能开发█  (Enter:create  Esc:cancel)
+```
+
+会在新终端 tab 中打开 `claude`。如果输入了名称，工具会自动检测新对话并重命名。
+
+#### 重命名对话
+
+在列表页或详情页按 `n`，输入新名称后按 `Enter` 确认：
+
+```
+ Rename: 我的新对话名称█  (Enter:confirm  Esc:cancel)
+```
+
+如果已有自定义标题，会预填现有名称供编辑。已有的标题会被**覆盖**（不会重复）。修改后在 Claude Code 内置的 `/resume` 列表中也会同步显示。
 
 #### 恢复对话
 
@@ -280,6 +347,9 @@ cc-sessions delete a3b7c912               # 删除（自动备份 + 确认）
 cc-sessions delete -f a3b7c912            # 强制删除，跳过确认
 cc-sessions delete --before 2025-01-01    # 批量删除旧对话
 
+cc-sessions rename a3b7c912 "新名称"      # 重命名对话
+cc-sessions rename a3b7c912               # 交互式重命名（提示输入）
+
 cc-sessions clean --dry-run               # 预览孤立文件
 cc-sessions clean                         # 清理孤立文件
 cc-sessions stats                         # 磁盘占用统计
@@ -301,3 +371,21 @@ Show the output to the user.
 ```
 
 然后在 Claude Code 中使用 `/sessions list -n 5`。
+
+### 配置文件
+
+在 `cc-sessions.py` 同目录下创建 `config.json`（或放在 `~/.config/cc-sessions/config.json`）：
+
+```jsonc
+{
+    // 新建对话时的工作目录（默认: "~"）
+    // 在 TUI 中按 '+' 时，claude 会在该目录下打开
+    "new_session_cwd": "~/Codes"
+}
+```
+
+| 设置 | 默认值 | 说明 |
+|------|--------|------|
+| `new_session_cwd` | `~` | 按 `+` 新建对话时的工作目录 |
+
+所有字段可选。配置文件支持 `//` 注释。

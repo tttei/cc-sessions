@@ -33,6 +33,43 @@ BACKUPS_DIR = CLAUDE_DIR / "backups" / "sessions"
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATHS = [
+    SCRIPT_DIR / "config.json",                          # next to script
+    Path.home() / ".config" / "cc-sessions" / "config.json",  # XDG style
+]
+
+# ─── Config ──────────────────────────────────────────────────────────
+
+# Defaults — overridden by config.json
+CONFIG = {
+    "new_session_cwd": "~",   # working directory for new sessions
+}
+
+
+def _load_config():
+    """Load config from config.json (supports // comments)."""
+    for path in CONFIG_PATHS:
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+                # Strip // comments (not inside strings — good enough for simple configs)
+                lines = []
+                for line in text.splitlines():
+                    stripped = line.lstrip()
+                    if stripped.startswith("//"):
+                        continue
+                    # Remove trailing // comments (naive but works for our simple config)
+                    lines.append(line)
+                data = json.loads("\n".join(lines))
+                CONFIG.update(data)
+                return
+            except (json.JSONDecodeError, OSError):
+                pass
+
+
+_load_config()
+
 
 # ─── Colors ───────────────────────────────────────────────────────────
 
@@ -683,6 +720,90 @@ class SessionManager:
             print(C.yellow(f"Warning: failed to clean history.jsonl: {e}"))
             return 0
 
+    def rename_session(self, session_id: str, new_title: str) -> bool:
+        """Rename a session by replacing or appending a custom-title line in its jsonl file.
+
+        If a custom-title line already exists for this session, it is replaced (overwritten).
+        Otherwise, a new line is appended.
+        """
+        info = self.get_session_info(session_id)
+        if not info or not info.jsonl_path or not info.jsonl_path.exists():
+            return False
+
+        jsonl_path = info.jsonl_path
+        new_line = json.dumps({
+            "type": "custom-title",
+            "customTitle": new_title,
+            "sessionId": session_id,
+        }, ensure_ascii=False) + "\n"
+
+        try:
+            # Read all lines and check if custom-title already exists
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+
+            found = False
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if '"custom-title"' not in stripped:
+                    continue
+                try:
+                    d = json.loads(stripped)
+                    if d.get("type") == "custom-title" and d.get("sessionId") == session_id:
+                        lines[i] = new_line
+                        found = True
+                        # Don't break — replace ALL occurrences
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            if not found:
+                lines.append(new_line)
+
+            # Atomic write
+            fd, tmp = tempfile.mkstemp(dir=str(jsonl_path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                os.replace(tmp, jsonl_path)
+            except Exception:
+                os.unlink(tmp)
+                raise
+
+            # Also update sessions-index.json if it exists
+            self._update_sessions_index_title(info.project_dir, session_id, new_title)
+            return True
+        except Exception:
+            return False
+
+    def _update_sessions_index_title(self, project_dir: Path, session_id: str, new_title: str):
+        """Update the customTitle in sessions-index.json if the entry exists."""
+        idx_path = project_dir / "sessions-index.json"
+        if not idx_path.exists():
+            return
+        try:
+            with open(idx_path) as f:
+                data = json.load(f)
+            entries = data.get("entries", [])
+            updated = False
+            for entry in entries:
+                if entry.get("sessionId") == session_id:
+                    entry["customTitle"] = new_title
+                    updated = True
+                    break
+            if updated:
+                fd, tmp = tempfile.mkstemp(dir=str(project_dir), suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(data, f, indent=2)
+                    os.replace(tmp, idx_path)
+                except Exception:
+                    os.unlink(tmp)
+                    raise
+        except Exception:
+            pass
+
     def _remove_from_sessions_index(self, project_dir: Path, session_id: str):
         """Remove entry from sessions-index.json."""
         idx_path = project_dir / "sessions-index.json"
@@ -823,10 +944,17 @@ class TUI:
         self.cursor = 0
         self.scroll = 0
         self.search_query = ""
-        self.mode = "list"  # list, search, confirm_delete, detail
+        self.mode = "list"  # list, search, confirm_delete, detail, rename, create
         self.message = ""
         self.message_color = 0
         self.delete_target: Optional[SessionInfo] = None
+        self.rename_target: Optional[SessionInfo] = None
+        self.rename_input: str = ""
+        self._rename_return_mode: str = "list"
+        self.create_name: str = ""
+        self._pre_create_session_ids: set = set()
+        self._pending_rename: Optional[str] = None
+        self._pending_rename_ids: set = set()
         self._resume_pending: Optional[Tuple[str, str]] = None  # (session_id, cwd)
 
     def run(self):
@@ -854,7 +982,18 @@ class TUI:
 
         while True:
             self._draw()
+
+            # Use timeout when waiting for new session to appear
+            if self._pending_rename:
+                stdscr.timeout(2000)  # check every 2 seconds
+            else:
+                stdscr.timeout(-1)  # blocking
+
             key = stdscr.getch()
+
+            if key == -1:  # timeout, no key pressed
+                self._check_pending_rename()
+                continue
 
             if self.mode == "search":
                 if key == 27:  # ESC
@@ -884,6 +1023,46 @@ class TUI:
                     self.message = "Cancelled."
                     self.message_color = 3
 
+            elif self.mode == "create":
+                if key == 27:  # ESC — cancel
+                    self.mode = "list"
+                    self.create_name = ""
+                    self.message = "Cancelled."
+                    self.message_color = 3
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    self.create_name = self.create_name[:-1]
+                elif key == 10:  # Enter — create session
+                    self._do_create_session()
+                elif 32 <= key <= 126:
+                    self.create_name += chr(key)
+
+            elif self.mode == "rename":
+                if key == 27:  # ESC — cancel
+                    self.mode = self._rename_return_mode or "list"
+                    self.rename_target = None
+                    self.rename_input = ""
+                    self.message = "Rename cancelled."
+                    self.message_color = 3
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    self.rename_input = self.rename_input[:-1]
+                elif key == 10:  # Enter — confirm rename
+                    if self.rename_target and self.rename_input.strip():
+                        ok = self.mgr.rename_session(
+                            self.rename_target.session_id, self.rename_input.strip()
+                        )
+                        if ok:
+                            self.rename_target.custom_title = self.rename_input.strip()
+                            self.message = f"Renamed to '{self.rename_input.strip()[:30]}'"
+                            self.message_color = 2
+                        else:
+                            self.message = "Rename failed."
+                            self.message_color = 4
+                    self.mode = self._rename_return_mode or "list"
+                    self.rename_target = None
+                    self.rename_input = ""
+                elif 32 <= key <= 126:
+                    self.rename_input += chr(key)
+
             elif self.mode == "detail":
                 if key in (ord("q"), 27, ord("h"), curses.KEY_LEFT):
                     self.mode = "list"
@@ -898,6 +1077,12 @@ class TUI:
                 elif key == ord("c"):  # copy session ID to clipboard
                     if self.filtered:
                         self._copy_to_clipboard(self.filtered[self.cursor].session_id)
+                elif key == ord("n"):  # rename
+                    if self.filtered:
+                        self.rename_target = self.filtered[self.cursor]
+                        self.rename_input = self.rename_target.custom_title or ""
+                        self._rename_return_mode = "detail"
+                        self.mode = "rename"
 
             else:  # list mode
                 if key in (ord("q"), ord("Q")):
@@ -924,6 +1109,16 @@ class TUI:
                 elif key == ord("c"):  # copy session ID to clipboard
                     if self.filtered:
                         self._copy_to_clipboard(self.filtered[self.cursor].session_id)
+                elif key == ord("n"):  # rename
+                    if self.filtered:
+                        self.rename_target = self.filtered[self.cursor]
+                        self.rename_input = self.rename_target.custom_title or ""
+                        self._rename_return_mode = "list"
+                        self.mode = "rename"
+                elif key == ord("+") or key == ord("a"):  # create new session
+                    self.create_name = ""
+                    self._pre_create_session_ids = {s.session_id for s in self.sessions}
+                    self.mode = "create"
                 elif key == ord("r") or key == ord("R"):
                     self._load_sessions()
                     self.message = "Refreshed."
@@ -983,6 +1178,81 @@ class TUI:
         except Exception:
             self.message = "Failed to copy (pbcopy not available)"
             self.message_color = 4
+
+    def _do_create_session(self):
+        """Create a new Claude session in a new terminal tab."""
+        name = self.create_name.strip()
+        cwd = os.path.expanduser(CONFIG["new_session_cwd"])
+
+        cmd = f'cd {cwd} && claude'
+
+        iterm_script = f'''
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+        end tell
+        if frontApp is "iTerm2" then
+            tell application "iTerm2"
+                tell current window
+                    create tab with default profile
+                    tell current session
+                        write text "{cmd}"
+                    end tell
+                end tell
+            end tell
+        else
+            tell application "Terminal"
+                activate
+                do script "{cmd}"
+            end tell
+        end if
+        '''
+        try:
+            subprocess.Popen(
+                ["osascript", "-e", iterm_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if name:
+                # Schedule a delayed rename: poll for the new session
+                self._pending_rename = name
+                self._pending_rename_ids = self._pre_create_session_ids.copy()
+                self.message = f"New session opened. Will rename to '{name[:30]}' once detected..."
+            else:
+                self._pending_rename = None
+                self.message = "New session opened in new tab."
+            self.message_color = 2
+        except Exception as e:
+            self.message = f"Failed to open terminal: {e}"
+            self.message_color = 4
+            self._pending_rename = None
+
+        self.create_name = ""
+        self.mode = "list"
+
+    def _check_pending_rename(self):
+        """Check if a newly created session appeared and rename it."""
+        if not getattr(self, '_pending_rename', None):
+            return
+        # Re-scan sessions
+        current = self.mgr.discover_sessions()
+        current_ids = {s.session_id for s in current}
+        new_ids = current_ids - self._pending_rename_ids
+        if new_ids:
+            # Found new session(s) — rename the most recent one
+            new_sessions = [s for s in current if s.session_id in new_ids]
+            new_sessions.sort(key=lambda s: s.modified or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            target = new_sessions[0]
+            ok = self.mgr.rename_session(target.session_id, self._pending_rename)
+            if ok:
+                self.message = f"Renamed new session to '{self._pending_rename[:30]}'"
+                self.message_color = 2
+            else:
+                self.message = f"New session created but rename failed. Use /rename in Claude."
+                self.message_color = 3
+            self._pending_rename = None
+            # Refresh list
+            self.sessions = current
+            self._apply_filter()
 
     def _load_sessions(self):
         self.sessions = self.mgr.discover_sessions()
@@ -1129,8 +1399,16 @@ class TUI:
             if target:
                 prompt = f" Delete '{target.display_title[:30]}'? (y/N) "
                 self._safe_addstr(footer_y, 0, prompt[:w-1], w - 1, curses.A_BOLD | curses.color_pair(4))
+        elif self.mode == "rename":
+            rename_str = f" Rename: {self.rename_input}█  (Enter:confirm  Esc:cancel)"
+            self._safe_addstr(footer_y, 0, " " * (w - 1), w - 1, curses.color_pair(3))
+            self._safe_addstr(footer_y, 0, rename_str[:w-1], w - 1, curses.A_BOLD | curses.color_pair(3))
+        elif self.mode == "create":
+            create_str = f" Name: {self.create_name}█  (Enter:create  Esc:cancel)"
+            self._safe_addstr(footer_y, 0, " " * (w - 1), w - 1, curses.color_pair(2))
+            self._safe_addstr(footer_y, 0, create_str[:w-1], w - 1, curses.A_BOLD | curses.color_pair(2))
         else:
-            footer = " j/k:move  Enter:detail  /:search  d:delete  c:copy ID  r:refresh  q:quit "
+            footer = " j/k:move  Enter:detail  /:search  +:new  n:rename  d:delete  c:copy  r:refresh  q:quit "
             self._safe_addstr(footer_y, 0, "─" * (w - 1), w - 1, curses.color_pair(1))
             if len(footer) < w - 1:
                 self._safe_addstr(footer_y, 1, footer, len(footer), curses.color_pair(1))
@@ -1221,9 +1499,14 @@ class TUI:
 
         # Footer
         footer_y = h - 1
-        footer = " q:back  Enter:resume  d:delete  c:copy ID "
-        self._safe_addstr(footer_y, 0, "─" * (w - 1), w - 1, curses.color_pair(1))
-        self._safe_addstr(footer_y, 1, footer, len(footer), curses.color_pair(1))
+        if self.mode == "rename":
+            rename_str = f" Rename: {self.rename_input}█  (Enter:confirm  Esc:cancel)"
+            self._safe_addstr(footer_y, 0, " " * (w - 1), w - 1, curses.color_pair(3))
+            self._safe_addstr(footer_y, 0, rename_str[:w-1], w - 1, curses.A_BOLD | curses.color_pair(3))
+        else:
+            footer = " q:back  Enter:resume  n:rename  d:delete  c:copy ID "
+            self._safe_addstr(footer_y, 0, "─" * (w - 1), w - 1, curses.color_pair(1))
+            self._safe_addstr(footer_y, 1, footer, len(footer), curses.color_pair(1))
 
         self.stdscr.refresh()
 
@@ -1391,6 +1674,36 @@ def cmd_stats(args):
     print()
 
 
+def cmd_rename(args):
+    mgr = SessionManager()
+    sid = _resolve_session_id(mgr, args.session_id)
+    if not sid:
+        return
+
+    info = mgr.get_session_info(sid)
+    if not info:
+        print(C.red(f"Session not found: {sid}"))
+        return
+
+    if info.custom_title:
+        print(f"  Current title: {C.cyan(info.custom_title)}")
+    else:
+        print(f"  Current title: {C.dim('(none)')}")
+        print(f"  First message: {info.first_prompt[:80]}")
+
+    new_title = args.title
+    if not new_title:
+        new_title = input("  New title: ").strip()
+    if not new_title:
+        print("Aborted.")
+        return
+
+    if mgr.rename_session(sid, new_title):
+        print(C.green(f"  Renamed to: {new_title}"))
+    else:
+        print(C.red("  Rename failed."))
+
+
 def cmd_tui(args):
     tui = TUI()
     tui.run()
@@ -1430,6 +1743,11 @@ def main():
     p_delete.add_argument("--dry-run", action="store_true", help="Preview without deleting")
     p_delete.add_argument("--force", "-f", action="store_true", help="Skip confirmation")
 
+    # rename
+    p_rename = subparsers.add_parser("rename", aliases=["mv"], help="Rename a session")
+    p_rename.add_argument("session_id", help="Session ID (full or partial)")
+    p_rename.add_argument("title", nargs="?", help="New title (prompts if not given)")
+
     # clean
     p_clean = subparsers.add_parser("clean", help="Clean orphaned metadata")
     p_clean.add_argument("--dry-run", action="store_true", help="Preview without deleting")
@@ -1454,6 +1772,7 @@ def main():
         "search": cmd_search, "find": cmd_search,
         "info": cmd_info, "show": cmd_info,
         "delete": cmd_delete, "rm": cmd_delete,
+        "rename": cmd_rename, "mv": cmd_rename,
         "clean": cmd_clean,
         "stats": cmd_stats,
     }
