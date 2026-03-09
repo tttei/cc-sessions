@@ -8,9 +8,25 @@
 
 ## English
 
-A TUI + CLI tool for managing Claude Code conversation history: browse, search, rename, resume, delete sessions.
+Claude Code has basic session management (`/resume`, `/rename`), but lacks the ability to search content, delete sessions, clean up disk space, or manage sessions across projects. **cc-sessions** fills that gap with a TUI + CLI tool.
 
 Pure Python 3 stdlib, no external dependencies.
+
+### Why cc-sessions?
+
+| Feature | Claude Code built-in | cc-sessions |
+|---------|---------------------|-------------|
+| List sessions | `/resume` (current project only) | All sessions across all projects |
+| Search by title | `/resume` search box | Title + first message + session ID |
+| Search by content | - | Full conversation content search |
+| Rename session | `/rename` (current session only) | Any session, from TUI or CLI |
+| Resume session | `/resume` (replaces current) | Opens in new tab, TUI stays open |
+| Delete session | - | Single, bulk (by date), with auto-backup |
+| Clean orphaned files | - | Detect and remove orphaned metadata |
+| Disk usage stats | - | Per-project and total breakdown |
+| Create new session | `claude` | From TUI, with optional auto-naming |
+| Copy session ID | - | One-key copy to clipboard |
+| Config file | - | Customizable (e.g. default working directory) |
 
 ### Install
 
@@ -202,9 +218,25 @@ All fields are optional. The file supports `//` comments.
 
 ## 中文版
 
-管理 Claude Code 对话记录的 TUI + CLI 工具：浏览、搜索、重命名、恢复、删除会话。
+Claude Code 内置的对话管理功能有限（只有 `/resume` 和 `/rename`），无法搜索对话内容、删除对话、清理磁盘空间，也无法跨项目管理。**cc-sessions** 补齐了这些缺失的功能。
 
 纯 Python 3 标准库实现，无外部依赖。
+
+### 为什么需要 cc-sessions?
+
+| 功能 | Claude Code 内置 | cc-sessions |
+|------|-----------------|-------------|
+| 列出对话 | `/resume`（仅当前项目） | 所有项目的所有对话 |
+| 按标题搜索 | `/resume` 搜索框 | 标题 + 首条消息 + session ID |
+| 按内容搜索 | - | 全文搜索对话内容 |
+| 重命名对话 | `/rename`（仅当前对话） | 任意对话，TUI 或 CLI |
+| 恢复对话 | `/resume`（替换当前对话） | 在新 tab 中打开，TUI 保持运行 |
+| 删除对话 | - | 单个、批量（按日期），自动备份 |
+| 清理孤立文件 | - | 检测并删除无主的元数据文件 |
+| 磁盘占用统计 | - | 按项目和总量分类统计 |
+| 新建对话 | `claude` | 从 TUI 直接创建，支持自动命名 |
+| 复制 session ID | - | 一键复制到剪贴板 |
+| 配置文件 | - | 可自定义（如默认工作目录） |
 
 ### 安装
 
