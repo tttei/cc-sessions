@@ -952,9 +952,11 @@ class TUI:
         self.rename_input: str = ""
         self._rename_return_mode: str = "list"
         self.create_name: str = ""
+        self.create_cwd: str = ""  # chosen workspace cwd for new session
         self._pre_create_session_ids: set = set()
         self._pending_rename: Optional[str] = None
         self._pending_rename_ids: set = set()
+        self._create_timestamp: Optional[datetime] = None
         self._resume_pending: Optional[Tuple[str, str]] = None  # (session_id, cwd)
 
     def run(self):
@@ -1023,10 +1025,30 @@ class TUI:
                     self.message = "Cancelled."
                     self.message_color = 3
 
+            elif self.mode == "choose_workspace":
+                if key == 27:  # ESC — cancel
+                    self.mode = "list"
+                    self.message = "Cancelled."
+                    self.message_color = 3
+                else:
+                    workspaces = CONFIG.get("workspaces", {})
+                    pressed = chr(key).lower() if 32 <= key <= 126 else ""
+                    if pressed in workspaces:
+                        ws = workspaces[pressed]
+                        self.create_cwd = os.path.expanduser(ws["path"])
+                        self.create_name = ""
+                        self.mode = "create"
+                    elif not workspaces:
+                        # No workspaces configured, fall back to default
+                        self.create_cwd = os.path.expanduser(CONFIG["new_session_cwd"])
+                        self.create_name = ""
+                        self.mode = "create"
+
             elif self.mode == "create":
                 if key == 27:  # ESC — cancel
                     self.mode = "list"
                     self.create_name = ""
+                    self.create_cwd = ""
                     self.message = "Cancelled."
                     self.message_color = 3
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
@@ -1117,8 +1139,17 @@ class TUI:
                         self.mode = "rename"
                 elif key == ord("+") or key == ord("a"):  # create new session
                     self.create_name = ""
-                    self._pre_create_session_ids = {s.session_id for s in self.sessions}
-                    self.mode = "create"
+                    self.create_cwd = ""
+                    # Fresh scan to avoid stale snapshot missing recently created sessions
+                    fresh = self.mgr.discover_sessions()
+                    self._pre_create_session_ids = {s.session_id for s in fresh}
+                    self._create_timestamp = datetime.now(timezone.utc)
+                    workspaces = CONFIG.get("workspaces", {})
+                    if workspaces:
+                        self.mode = "choose_workspace"
+                    else:
+                        self.create_cwd = os.path.expanduser(CONFIG["new_session_cwd"])
+                        self.mode = "create"
                 elif key == ord("r") or key == ord("R"):
                     self._load_sessions()
                     self.message = "Refreshed."
@@ -1129,8 +1160,12 @@ class TUI:
         sid = session.session_id
         cwd = session.cwd or os.path.expanduser("~")
 
-        # Build the command to run in new tab
-        cmd = f'cd {cwd} && claude --resume {sid}'
+        # Build the command to run in new tab.
+        # Lead with `true ;` so that if the shell drops the first injected
+        # char on a cold start, it degrades to a visible "command not found"
+        # instead of silently turning `cd` into oh-my-zsh's `d` (which would
+        # launch claude in the wrong directory).
+        cmd = f'true ; cd {cwd} && claude --dangerously-skip-permissions --resume {sid}'
 
         # Use AppleScript to open a new Terminal/iTerm2 tab
         # Try iTerm2 first, fall back to Terminal.app
@@ -1143,6 +1178,7 @@ class TUI:
                 tell current window
                     create tab with default profile
                     tell current session
+                        delay 0.8
                         write text "{cmd}"
                     end tell
                 end tell
@@ -1150,7 +1186,9 @@ class TUI:
         else
             tell application "Terminal"
                 activate
-                do script "{cmd}"
+                set newWin to do script ""
+                delay 0.8
+                do script "{cmd}" in newWin
             end tell
         end if
         '''
@@ -1182,9 +1220,11 @@ class TUI:
     def _do_create_session(self):
         """Create a new Claude session in a new terminal tab."""
         name = self.create_name.strip()
-        cwd = os.path.expanduser(CONFIG["new_session_cwd"])
+        cwd = self.create_cwd or os.path.expanduser(CONFIG["new_session_cwd"])
 
-        cmd = f'cd {cwd} && claude'
+        # Lead with `true ;` — see _resume_in_new_terminal for rationale (guards
+        # against a dropped first char silently turning `cd` into `d`).
+        cmd = f'true ; cd {cwd} && claude --dangerously-skip-permissions'
 
         iterm_script = f'''
         tell application "System Events"
@@ -1195,6 +1235,7 @@ class TUI:
                 tell current window
                     create tab with default profile
                     tell current session
+                        delay 0.8
                         write text "{cmd}"
                     end tell
                 end tell
@@ -1202,7 +1243,9 @@ class TUI:
         else
             tell application "Terminal"
                 activate
-                do script "{cmd}"
+                set newWin to do script ""
+                delay 0.8
+                do script "{cmd}" in newWin
             end tell
         end if
         '''
@@ -1238,8 +1281,15 @@ class TUI:
         current_ids = {s.session_id for s in current}
         new_ids = current_ids - self._pending_rename_ids
         if new_ids:
-            # Found new session(s) — rename the most recent one
+            # Found new session(s) — filter by creation time then pick the most recent
             new_sessions = [s for s in current if s.session_id in new_ids]
+            if self._create_timestamp:
+                new_sessions = [
+                    s for s in new_sessions
+                    if s.created and s.created >= self._create_timestamp
+                ]
+            if not new_sessions:
+                return
             new_sessions.sort(key=lambda s: s.modified or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
             target = new_sessions[0]
             ok = self.mgr.rename_session(target.session_id, self._pending_rename)
@@ -1250,6 +1300,7 @@ class TUI:
                 self.message = f"New session created but rename failed. Use /rename in Claude."
                 self.message_color = 3
             self._pending_rename = None
+            self._create_timestamp = None
             # Refresh list
             self.sessions = current
             self._apply_filter()
@@ -1403,8 +1454,21 @@ class TUI:
             rename_str = f" Rename: {self.rename_input}█  (Enter:confirm  Esc:cancel)"
             self._safe_addstr(footer_y, 0, " " * (w - 1), w - 1, curses.color_pair(3))
             self._safe_addstr(footer_y, 0, rename_str[:w-1], w - 1, curses.A_BOLD | curses.color_pair(3))
+        elif self.mode == "choose_workspace":
+            workspaces = CONFIG.get("workspaces", {})
+            choices = "  ".join(f"{k.upper()}:{ws['label']}" for k, ws in workspaces.items())
+            ws_str = f" Workspace: {choices}  (Esc:cancel)"
+            self._safe_addstr(footer_y, 0, " " * (w - 1), w - 1, curses.color_pair(7))
+            self._safe_addstr(footer_y, 0, ws_str[:w-1], w - 1, curses.A_BOLD | curses.color_pair(7))
         elif self.mode == "create":
-            create_str = f" Name: {self.create_name}█  (Enter:create  Esc:cancel)"
+            # Show chosen workspace label in prompt
+            ws_label = ""
+            workspaces = CONFIG.get("workspaces", {})
+            for ws in workspaces.values():
+                if os.path.expanduser(ws["path"]) == self.create_cwd:
+                    ws_label = f"[{ws['label']}] "
+                    break
+            create_str = f" {ws_label}Name: {self.create_name}█  (Enter:create  Esc:cancel)"
             self._safe_addstr(footer_y, 0, " " * (w - 1), w - 1, curses.color_pair(2))
             self._safe_addstr(footer_y, 0, create_str[:w-1], w - 1, curses.A_BOLD | curses.color_pair(2))
         else:
